@@ -1,0 +1,411 @@
+"""
+shop_manager (Android) - برنامج فواتير ومحاسبة للمحلات الصغيرة.
+يشتغل بدون إنترنت، والبيانات محفوظة محلياً في الجهاز.
+"""
+
+import os
+import sqlite3
+from datetime import datetime
+
+import arabic_reshaper
+from bidi.algorithm import get_display
+
+from kivy.app import App
+from kivy.core.text import LabelBase
+from kivy.metrics import dp
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.button import Button
+from kivy.uix.label import Label
+from kivy.uix.popup import Popup
+from kivy.uix.scrollview import ScrollView
+from kivy.uix.spinner import Spinner
+from kivy.uix.tabbedpanel import TabbedPanel, TabbedPanelItem
+from kivy.uix.textinput import TextInput
+
+FONT = "Arabic"
+FONT_FILE = "Amiri-Regular.ttf"  # ملف الخط لازم يكون بنفس المجلد
+CURRENCY = "د.ع"
+DB_PATH = None  # يتحدد وقت التشغيل
+
+
+# ---------- أدوات ----------
+
+def ar(text):
+    """يحول النص العربي لشكل يظهر صح في Kivy."""
+    return get_display(arabic_reshaper.reshape(str(text)))
+
+
+def fmt(n):
+    return f"{n:,.0f} {CURRENCY}"
+
+
+def alert(message):
+    Popup(
+        title=ar("تنبيه"),
+        content=Label(text=ar(message), font_name=FONT),
+        size_hint=(0.8, 0.3),
+    ).open()
+
+
+def query(sql, params=()):
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        return conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+
+
+def run(sql, params=()):
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cur = conn.execute(sql, params)
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS products (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            price REAL NOT NULL,
+            qty INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS invoices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            total REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS invoice_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            invoice_id INTEGER NOT NULL,
+            product_name TEXT NOT NULL,
+            price REAL NOT NULL,
+            qty INTEGER NOT NULL,
+            subtotal REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS expenses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            title TEXT NOT NULL,
+            amount REAL NOT NULL
+        );
+    """)
+    conn.commit()
+    conn.close()
+
+
+def wrap_label(label):
+    """يخلي النص يلف داخل عرض الشاشة ويتوسع بالطول."""
+    label.bind(width=lambda lbl, w: setattr(lbl, "text_size", (w, None)))
+    label.bind(texture_size=lambda lbl, s: setattr(lbl, "height", s[1]))
+
+
+# ---------- تبويب الفواتير ----------
+
+class SalesTab(BoxLayout):
+    def __init__(self, **kwargs):
+        super().__init__(orientation="vertical", padding=dp(8),
+                         spacing=dp(8), **kwargs)
+        self.cart = []
+        self.products = {}  # النص المعروض -> بيانات المنتج
+
+        top = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(6))
+        self.spinner = Spinner(text=ar("اختر منتج"), font_name=FONT,
+                               size_hint_x=2)
+        self.qty = TextInput(text="1", input_filter="int", multiline=False,
+                             size_hint_x=1)
+        add_btn = Button(text=ar("إضافة"), font_name=FONT, size_hint_x=1)
+        add_btn.bind(on_release=self.add_item)
+        top.add_widget(self.spinner)
+        top.add_widget(self.qty)
+        top.add_widget(add_btn)
+        self.add_widget(top)
+
+        self.cart_label = Label(font_name=FONT, halign="right",
+                                valign="top", size_hint_y=None)
+        wrap_label(self.cart_label)
+        scroll = ScrollView()
+        scroll.add_widget(self.cart_label)
+        self.add_widget(scroll)
+
+        self.total_label = Label(font_name=FONT, halign="right",
+                                 size_hint_y=None, height=dp(32))
+        self.total_label.bind(width=lambda l, w: setattr(l, "text_size", (w, None)))
+        self.add_widget(self.total_label)
+
+        bottom = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(6))
+        clear_btn = Button(text=ar("تفريغ"), font_name=FONT)
+        clear_btn.bind(on_release=lambda *_: self.clear_cart())
+        save_btn = Button(text=ar("حفظ الفاتورة"), font_name=FONT)
+        save_btn.bind(on_release=self.save_invoice)
+        bottom.add_widget(clear_btn)
+        bottom.add_widget(save_btn)
+        self.add_widget(bottom)
+
+        self.refresh_cart()
+
+    def load_products(self):
+        rows = query("SELECT * FROM products ORDER BY name")
+        self.products = {}
+        values = []
+        for r in rows:
+            label = ar(f"{r['name']} (متوفر: {r['qty']})")
+            self.products[label] = dict(r)
+            values.append(label)
+        self.spinner.values = values
+
+    def add_item(self, *_):
+        item = self.products.get(self.spinner.text)
+        if not item:
+            alert("اختر منتج أولاً")
+            return
+        try:
+            qty = int(self.qty.text)
+            if qty <= 0:
+                raise ValueError
+        except ValueError:
+            alert("الكمية لازم تكون رقم أكبر من صفر")
+            return
+
+        already = sum(i["qty"] for i in self.cart if i["id"] == item["id"])
+        if already + qty > item["qty"]:
+            alert(f"المتوفر من {item['name']}: {item['qty']} فقط")
+            return
+
+        self.cart.append({"id": item["id"], "name": item["name"],
+                          "price": item["price"], "qty": qty})
+        self.qty.text = "1"
+        self.refresh_cart()
+
+    def clear_cart(self):
+        self.cart = []
+        self.refresh_cart()
+
+    def refresh_cart(self):
+        total = 0
+        lines = []
+        for i in self.cart:
+            sub = i["price"] * i["qty"]
+            total += sub
+            lines.append(f"{i['name']}  x{i['qty']}  = {fmt(sub)}")
+        self.cart_label.text = "\n".join(ar(line) for line in lines)
+        self.total_label.text = ar(f"الإجمالي: {fmt(total)}")
+
+    def save_invoice(self, *_):
+        if not self.cart:
+            alert("الفاتورة فاضية")
+            return
+
+        # نتأكد من المخزون قبل الحفظ
+        for item in self.cart:
+            stock = query("SELECT qty FROM products WHERE id = ?",
+                          (item["id"],))[0]["qty"]
+            if item["qty"] > stock:
+                alert(f"المخزون ما يكفي لـ {item['name']}")
+                return
+
+        now = datetime.now()
+        total = sum(i["price"] * i["qty"] for i in self.cart)
+        invoice_id = run("INSERT INTO invoices (created_at, total) VALUES (?, ?)",
+                         (now.isoformat(timespec="seconds"), total))
+
+        for item in self.cart:
+            run("""INSERT INTO invoice_items
+                   (invoice_id, product_name, price, qty, subtotal)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (invoice_id, item["name"], item["price"], item["qty"],
+                 item["price"] * item["qty"]))
+            run("UPDATE products SET qty = qty - ? WHERE id = ?",
+                (item["qty"], item["id"]))
+
+        self.clear_cart()
+        App.get_running_app().refresh_all()
+        alert(f"تم حفظ الفاتورة رقم {invoice_id}")
+
+
+# ---------- تبويب المنتجات ----------
+
+class ProductsTab(BoxLayout):
+    def __init__(self, **kwargs):
+        super().__init__(orientation="vertical", padding=dp(8),
+                         spacing=dp(8), **kwargs)
+
+        form = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(6))
+        self.name = TextInput(hint_text=ar("اسم المنتج"), multiline=False,
+                              font_name=FONT)
+        self.price = TextInput(hint_text=ar("السعر"), input_filter="float",
+                               multiline=False, size_hint_x=0.6)
+        self.qty = TextInput(hint_text=ar("الكمية"), input_filter="int",
+                             multiline=False, size_hint_x=0.6)
+        form.add_widget(self.name)
+        form.add_widget(self.price)
+        form.add_widget(self.qty)
+        self.add_widget(form)
+
+        add_btn = Button(text=ar("إضافة / تحديث مخزون"), font_name=FONT,
+                         size_hint_y=None, height=dp(48))
+        add_btn.bind(on_release=self.add_product)
+        self.add_widget(add_btn)
+
+        self.list_label = Label(font_name=FONT, halign="right", valign="top",
+                                size_hint_y=None)
+        wrap_label(self.list_label)
+        scroll = ScrollView()
+        scroll.add_widget(self.list_label)
+        self.add_widget(scroll)
+
+        self.refresh()
+
+    def add_product(self, *_):
+        name = self.name.text.strip()
+        try:
+            price = float(self.price.text)
+            qty = int(self.qty.text or 0)
+        except ValueError:
+            alert("السعر والكمية لازم يكونون أرقام")
+            return
+        if not name or price < 0 or qty < 0:
+            alert("تأكد من البيانات")
+            return
+
+        existing = query("SELECT id FROM products WHERE name = ?", (name,))
+        if existing:
+            # المنتج موجود: نحدث السعر ونضيف الكمية
+            run("UPDATE products SET price = ?, qty = qty + ? WHERE name = ?",
+                (price, qty, name))
+        else:
+            run("INSERT INTO products (name, price, qty) VALUES (?, ?, ?)",
+                (name, price, qty))
+
+        self.name.text = ""
+        self.price.text = ""
+        self.qty.text = ""
+        App.get_running_app().refresh_all()
+
+    def refresh(self):
+        rows = query("SELECT * FROM products ORDER BY name")
+        lines = [f"{r['name']}   |   {fmt(r['price'])}   |   {r['qty']}"
+                 for r in rows] or ["ما في منتجات بعد"]
+        self.list_label.text = "\n".join(ar(line) for line in lines)
+
+
+# ---------- تبويب المصاريف والتقارير ----------
+
+class MoneyTab(BoxLayout):
+    def __init__(self, **kwargs):
+        super().__init__(orientation="vertical", padding=dp(8),
+                         spacing=dp(8), **kwargs)
+
+        form = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(6))
+        self.title = TextInput(hint_text=ar("البيان"), multiline=False)
+        self.amount = TextInput(hint_text=ar("المبلغ"), input_filter="float",
+                                multiline=False, size_hint_x=0.6)
+        form.add_widget(self.title)
+        form.add_widget(self.amount)
+        self.add_widget(form)
+
+        add_btn = Button(text=ar("إضافة مصروف"), font_name=FONT,
+                         size_hint_y=None, height=dp(48))
+        add_btn.bind(on_release=self.add_expense)
+        self.add_widget(add_btn)
+
+        self.report_label = Label(font_name=FONT, halign="right", valign="top",
+                                  size_hint_y=None)
+        wrap_label(self.report_label)
+        scroll = ScrollView()
+        scroll.add_widget(self.report_label)
+        self.add_widget(scroll)
+
+        self.refresh()
+
+    def add_expense(self, *_):
+        title = self.title.text.strip()
+        try:
+            amount = float(self.amount.text)
+        except ValueError:
+            alert("المبلغ لازم يكون رقم")
+            return
+        if not title or amount <= 0:
+            alert("تأكد من البيانات")
+            return
+
+        run("INSERT INTO expenses (created_at, title, amount) VALUES (?, ?, ?)",
+            (datetime.now().isoformat(timespec="seconds"), title, amount))
+        self.title.text = ""
+        self.amount.text = ""
+        self.refresh()
+
+    def _sum(self, table, column, prefix):
+        return query(
+            f"SELECT COALESCE(SUM({column}), 0) AS s FROM {table} "
+            f"WHERE created_at LIKE ?", (prefix + "%",))[0]["s"]
+
+    def refresh(self):
+        today = datetime.now().strftime("%Y-%m-%d")
+        month = datetime.now().strftime("%Y-%m")
+
+        s_day = self._sum("invoices", "total", today)
+        e_day = self._sum("expenses", "amount", today)
+        s_month = self._sum("invoices", "total", month)
+        e_month = self._sum("expenses", "amount", month)
+
+        lines = [
+            f"تقرير اليوم ({today})",
+            f"المبيعات: {fmt(s_day)}",
+            f"المصاريف: {fmt(e_day)}",
+            f"الربح التقريبي: {fmt(s_day - e_day)}",
+            "",
+            f"تقرير الشهر ({month})",
+            f"المبيعات: {fmt(s_month)}",
+            f"المصاريف: {fmt(e_month)}",
+            f"الربح التقريبي: {fmt(s_month - e_month)}",
+            "",
+            "آخر المصاريف:",
+        ]
+        for r in query("SELECT * FROM expenses ORDER BY id DESC LIMIT 20"):
+            lines.append(f"{r['created_at'][:10]}  {r['title']}  {fmt(r['amount'])}")
+
+        self.report_label.text = "\n".join(ar(line) for line in lines)
+
+
+# ---------- التطبيق ----------
+
+class ShopApp(App):
+    def build(self):
+        global DB_PATH
+        DB_PATH = os.path.join(self.user_data_dir, "shop.db")
+        LabelBase.register(name=FONT, fn_regular=FONT_FILE)
+        init_db()
+
+        self.sales = SalesTab()
+        self.products = ProductsTab()
+        self.money = MoneyTab()
+
+        panel = TabbedPanel(do_default_tab=False, tab_width=dp(140))
+        first = None
+        for title, widget in [("فاتورة", self.sales),
+                              ("المنتجات", self.products),
+                              ("المصاريف", self.money)]:
+            item = TabbedPanelItem(text=ar(title), font_name=FONT)
+            item.add_widget(widget)
+            panel.add_widget(item)
+            first = first or item
+        panel.switch_to(first)
+
+        self.refresh_all()
+        return panel
+
+    def refresh_all(self):
+        self.sales.load_products()
+        self.sales.refresh_cart()
+        self.products.refresh()
+        self.money.refresh()
+
+
+if __name__ == "__main__":
+    ShopApp().run()
